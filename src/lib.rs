@@ -1,6 +1,8 @@
 mod config;
 mod helper;
 
+pub use helper::{credential_from_helper, detect_default_helper, erase_credential, list_credentials, run_helper, store_credential};
+
 use base64::engine::general_purpose;
 use base64::Engine;
 use std::env;
@@ -14,7 +16,7 @@ use std::str;
 type Result<T> = std::result::Result<T, CredentialRetrievalError>;
 
 /// An error that occurred whilst attempting to retrieve a credential.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum CredentialRetrievalError {
     HelperCommunicationError,
     MalformedHelperResponse,
@@ -27,6 +29,18 @@ pub enum CredentialRetrievalError {
     NoCredentialConfigured,
     ConfigNotFound,
     ConfigReadError,
+    /// Stdin URL had no matching credential — sentinel string detected on stdout.
+    NotFound,
+    /// Helper exceeded the subprocess execution budget.
+    Timeout { seconds: u64 },
+    /// Helper stdout exceeded the configured cap.
+    OutputTooLarge { cap_bytes: usize },
+    /// Helper binary not found on PATH.
+    NotOnPath { name: String },
+    /// Helper resolved to a path outside the allowlisted prefixes.
+    UnsafePath { name: String, path: PathBuf },
+    /// Helper stdout was not valid JSON (when JSON was expected, e.g. `list`).
+    InvalidJson(serde_json::Error),
 }
 
 impl fmt::Display for CredentialRetrievalError {
@@ -58,11 +72,43 @@ impl fmt::Display for CredentialRetrievalError {
             }
             CredentialRetrievalError::ConfigNotFound => write!(f, "No config file found"),
             CredentialRetrievalError::ConfigReadError => write!(f, "Unable to read config"),
+            CredentialRetrievalError::NotFound => {
+                write!(f, "Credentials not found in native keychain")
+            }
+            CredentialRetrievalError::Timeout { seconds } => {
+                write!(f, "Credential helper timed out after {seconds}s")
+            }
+            CredentialRetrievalError::OutputTooLarge { cap_bytes } => {
+                write!(
+                    f,
+                    "Credential helper output exceeded {cap_bytes} bytes"
+                )
+            }
+            CredentialRetrievalError::NotOnPath { name } => {
+                write!(f, "Credential helper `{name}` not found on PATH")
+            }
+            CredentialRetrievalError::UnsafePath { name, path } => {
+                write!(
+                    f,
+                    "Credential helper `{name}` resolved to unsafe path {}",
+                    path.display()
+                )
+            }
+            CredentialRetrievalError::InvalidJson(err) => {
+                write!(f, "Credential helper returned invalid JSON: {err}")
+            }
         }
     }
 }
 
-impl Error for CredentialRetrievalError {}
+impl Error for CredentialRetrievalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            CredentialRetrievalError::InvalidJson(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 /// A docker credential, either a single identity token or a username/password pair.
 #[derive(Debug, PartialEq)]
@@ -218,6 +264,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // NOTE: tests use `matches!` instead of `assert_eq!` because the new
+    // `CredentialRetrievalError::InvalidJson(serde_json::Error)` variant blocks
+    // a `#[derive(PartialEq)]` on `CredentialRetrievalError` (serde_json::Error
+    // has no PartialEq impl). Behavior + intent identical to the original
+    // upstream tests.
+
     #[test]
     fn errors_when_no_relevant_config() {
         let empty_config = config::DockerConfig {
@@ -229,10 +281,10 @@ mod tests {
             |_: &str, _: &str| Err(CredentialRetrievalError::HelperCommunicationError);
         let result = extract_credential(empty_config, "some server", dummy_helper);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(CredentialRetrievalError::NoCredentialConfigured)
-        );
+        ));
     }
 
     #[test]
@@ -255,13 +307,14 @@ mod tests {
             |_: &str, _: &str| Err(CredentialRetrievalError::HelperCommunicationError);
         let result = extract_credential(auth_config, "some server", dummy_helper);
 
-        assert_eq!(
-            result,
-            Ok(DockerCredential::UsernamePassword(
-                String::from("some_user"),
-                String::from("some_password")
-            ))
-        );
+        let cred = result.expect("decode succeeds");
+        match cred {
+            DockerCredential::UsernamePassword(user, pwd) => {
+                assert_eq!(user, "some_user");
+                assert_eq!(pwd, "some_password");
+            }
+            other => panic!("unexpected credential: {:?}", other),
+        }
     }
 
     #[test]
@@ -291,13 +344,14 @@ mod tests {
 
             let result = extract_credential(auth_config, "some server", dummy_helper);
 
-            assert_eq!(
-                result,
-                Ok(DockerCredential::UsernamePassword(
-                    String::from("some_user"),
-                    String::from("some_password")
-                ))
-            );
+            let cred = result.expect("decode succeeds");
+            match cred {
+                DockerCredential::UsernamePassword(user, pwd) => {
+                    assert_eq!(user, "some_user");
+                    assert_eq!(pwd, "some_password");
+                }
+                other => panic!("unexpected credential: {:?}", other),
+            }
         }
     }
 
@@ -321,12 +375,11 @@ mod tests {
         };
         let result = extract_credential(helper_config, "some server", dummy_helper);
 
-        assert_eq!(
-            result,
-            Ok(DockerCredential::IdentityToken(String::from(
-                "expected_token"
-            )))
-        );
+        let cred = result.expect("identity token returned");
+        match cred {
+            DockerCredential::IdentityToken(token) => assert_eq!(token, "expected_token"),
+            other => panic!("unexpected credential: {:?}", other),
+        }
     }
 
     #[test]
@@ -347,11 +400,10 @@ mod tests {
         };
         let result = extract_credential(store_config, "some server", dummy_helper);
 
-        assert_eq!(
-            result,
-            Ok(DockerCredential::IdentityToken(String::from(
-                "expected_token"
-            )))
-        );
+        let cred = result.expect("identity token from store");
+        match cred {
+            DockerCredential::IdentityToken(token) => assert_eq!(token, "expected_token"),
+            other => panic!("unexpected credential: {:?}", other),
+        }
     }
 }
