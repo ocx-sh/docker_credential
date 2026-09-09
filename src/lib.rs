@@ -1,7 +1,7 @@
 mod config;
 mod helper;
 
-pub use helper::{credential_from_helper, detect_default_helper, erase_credential, list_credentials, run_helper, store_credential};
+pub use helper::{HELPER_TIMEOUT, credential_from_helper, credential_from_helper_with_timeout, detect_default_helper, erase_credential, erase_credential_with_timeout, list_credentials, run_helper, run_helper_with_timeout, store_credential, store_credential_with_timeout};
 
 use base64::engine::general_purpose;
 use base64::Engine;

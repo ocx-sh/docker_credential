@@ -9,7 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 /// 30-second budget for any single helper subprocess.
-const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Public so a caller that needs a shorter budget can state its own against the
+/// shipped one rather than re-spelling `30`.
+pub const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 64 KiB cap on helper stdout.
 const HELPER_OUTPUT_CAP: usize = 64 * 1024;
@@ -45,11 +48,28 @@ struct StoreRequest<'a> {
 /// Behavior:
 /// - Resolves the helper path via `resolve_helper_path` (PATH lookup + safety guard).
 /// - Caps stdout at 64 KiB; oversized stdout returns `OutputTooLarge`.
-/// - Enforces a 30s subprocess budget; overrun returns `Timeout`.
+/// - Enforces the [`HELPER_TIMEOUT`] subprocess budget; overrun returns `Timeout`.
 /// - Sentinel string `"credentials not found in native keychain"` on stdout
 ///   maps to `NotFound` regardless of exit code.
 /// - Non-zero exit without the sentinel returns `HelperFailure { stdout, stderr }`.
 pub fn run_helper(helper: &str, action: &str, stdin_bytes: &[u8]) -> Result<Vec<u8>> {
+    run_helper_with_timeout(helper, action, stdin_bytes, HELPER_TIMEOUT)
+}
+
+/// [`run_helper`] with the subprocess budget supplied by the caller.
+///
+/// Purely additive: `run_helper` is this function at [`HELPER_TIMEOUT`], and no
+/// existing caller changes. It exists because the budget is the *only* thing a
+/// test of the timeout path has to wait out — a helper that hangs is observed
+/// identically at 30 s and at 200 ms, so a fixed constant made every such test,
+/// this crate's own included, cost half a minute of real time to say something
+/// about a `recv_timeout` argument.
+pub fn run_helper_with_timeout(
+    helper: &str,
+    action: &str,
+    stdin_bytes: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let path = resolve_helper_path(helper)?;
     let stdin_owned = stdin_bytes.to_vec();
 
@@ -98,7 +118,7 @@ pub fn run_helper(helper: &str, action: &str, stdin_bytes: &[u8]) -> Result<Vec<
         let _ = tx.send((read_result, stdout_buf, stderr_buf, status_result));
     });
 
-    let outcome = rx.recv_timeout(HELPER_TIMEOUT);
+    let outcome = rx.recv_timeout(timeout);
     // Drain the stdin writer either way (if we time out the child gets killed,
     // which forces stdin write to fail and the thread to exit).
     if outcome.is_err() {
@@ -115,7 +135,7 @@ pub fn run_helper(helper: &str, action: &str, stdin_bytes: &[u8]) -> Result<Vec<
         // matters to the caller.
         drop(join_handle);
         return Err(CredentialRetrievalError::Timeout {
-            seconds: HELPER_TIMEOUT.as_secs(),
+            seconds: timeout.as_secs(),
         });
     }
     let (read_result, stdout_buf, stderr_buf, status_result) =
@@ -150,13 +170,22 @@ pub fn run_helper(helper: &str, action: &str, stdin_bytes: &[u8]) -> Result<Vec<
     Ok(stdout_buf)
 }
 
-fn response_from_helper(address: &str, helper: &str) -> Result<HelperResponse> {
-    let output = run_helper(helper, "get", address.as_bytes())?;
+fn response_from_helper(address: &str, helper: &str, timeout: Duration) -> Result<HelperResponse> {
+    let output = run_helper_with_timeout(helper, "get", address.as_bytes(), timeout)?;
     serde_json::from_slice(&output).map_err(|_| CredentialRetrievalError::MalformedHelperResponse)
 }
 
 pub fn credential_from_helper(address: &str, helper: &str) -> Result<DockerCredential> {
-    let response = response_from_helper(address, helper)?;
+    credential_from_helper_with_timeout(address, helper, HELPER_TIMEOUT)
+}
+
+/// [`credential_from_helper`] with the subprocess budget supplied by the caller.
+pub fn credential_from_helper_with_timeout(
+    address: &str,
+    helper: &str,
+    timeout: Duration,
+) -> Result<DockerCredential> {
+    let response = response_from_helper(address, helper, timeout)?;
 
     if response.username == "<token>" {
         Ok(DockerCredential::IdentityToken(response.secret))
@@ -178,6 +207,16 @@ pub fn store_credential(
     helper: &str,
     cred: &DockerCredential,
 ) -> Result<()> {
+    store_credential_with_timeout(server, helper, cred, HELPER_TIMEOUT)
+}
+
+/// [`store_credential`] with the subprocess budget supplied by the caller.
+pub fn store_credential_with_timeout(
+    server: &str,
+    helper: &str,
+    cred: &DockerCredential,
+    timeout: Duration,
+) -> Result<()> {
     let (username, secret) = match cred {
         DockerCredential::IdentityToken(token) => ("<token>", token.as_str()),
         DockerCredential::UsernamePassword(user, pwd) => (user.as_str(), pwd.as_str()),
@@ -188,7 +227,7 @@ pub fn store_credential(
         secret,
     };
     let bytes = serde_json::to_vec(&payload).map_err(|_| CredentialRetrievalError::HelperCommunicationError)?;
-    run_helper(helper, "store", &bytes)?;
+    run_helper_with_timeout(helper, "store", &bytes, timeout)?;
     Ok(())
 }
 
@@ -198,7 +237,12 @@ pub fn store_credential(
 /// A `NotFound` sentinel from the helper is treated as already-erased and
 /// surfaces as `Ok(())` so callers can use `erase` idempotently.
 pub fn erase_credential(server: &str, helper: &str) -> Result<()> {
-    match run_helper(helper, "erase", server.as_bytes()) {
+    erase_credential_with_timeout(server, helper, HELPER_TIMEOUT)
+}
+
+/// [`erase_credential`] with the subprocess budget supplied by the caller.
+pub fn erase_credential_with_timeout(server: &str, helper: &str, timeout: Duration) -> Result<()> {
+    match run_helper_with_timeout(helper, "erase", server.as_bytes(), timeout) {
         Ok(_) => Ok(()),
         Err(CredentialRetrievalError::NotFound) => Ok(()),
         Err(err) => Err(err),
@@ -442,21 +486,46 @@ mod tests {
         });
     }
 
+    /// The shipped budget is 30 s, asserted as a constant rather than waited out.
+    ///
+    /// Split from the behavioural row below deliberately. The two claims are
+    /// independent — *what* the budget is, and *that* it fires — and the old
+    /// single test could only make the first by paying the second in real time:
+    /// it slept a helper for 60 s and asserted `Timeout { seconds: 30 }`, which
+    /// cost ~30 s of every `cargo test` run on this crate.
+    #[test]
+    fn helper_timeout_is_thirty_seconds() {
+        assert_eq!(HELPER_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// The budget fires, and it fires at the value it was handed.
+    ///
+    /// Driven through `run_helper_with_timeout` at 200 ms: the code path is
+    /// `rx.recv_timeout(timeout)`, which cannot tell one `Duration` from
+    /// another, so a short budget observes exactly what a long one would. The
+    /// helper still sleeps far past it, which is what makes the pass mean the
+    /// timeout fired rather than the child exiting on its own.
     #[test]
     #[cfg(unix)]
-    fn run_helper_timeout_fires_at_30s() {
+    fn run_helper_timeout_fires_at_the_budget_it_is_given() {
         let _g = PATH_LOCK.lock().unwrap();
         let (dir, _bin) = make_mock_helper("sleep 60");
         with_path_prepended(dir.path(), || {
             let start = std::time::Instant::now();
-            let err = run_helper("test", "get", b"ghcr.io").expect_err("must time out");
+            let err = run_helper_with_timeout(
+                "test",
+                "get",
+                b"ghcr.io",
+                Duration::from_millis(200),
+            )
+            .expect_err("must time out");
             let elapsed = start.elapsed();
             assert!(
-                matches!(err, CredentialRetrievalError::Timeout { seconds: 30 }),
-                "expected Timeout {{ seconds: 30 }}, got: {err:?}",
+                matches!(err, CredentialRetrievalError::Timeout { seconds: 0 }),
+                "expected Timeout {{ seconds: 0 }} (200ms truncates), got: {err:?}",
             );
             assert!(
-                elapsed < std::time::Duration::from_secs(35),
+                elapsed < Duration::from_secs(5),
                 "timeout fired late ({:?})",
                 elapsed,
             );
