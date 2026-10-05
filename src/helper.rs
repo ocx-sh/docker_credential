@@ -91,7 +91,9 @@ pub fn run_helper_with_timeout(
         .stdin
         .take()
         .ok_or(CredentialRetrievalError::HelperCommunicationError)?;
-    let stdin_thread = thread::spawn(move || {
+    // Detached, never joined: a grandchild holding stdin open without reading
+    // would block this write, and a join on it, past the deadline.
+    thread::spawn(move || {
         let _ = child_stdin.write_all(&stdin_owned);
         // Closing stdin signals EOF to the helper.
         drop(child_stdin);
@@ -129,7 +131,6 @@ pub fn run_helper_with_timeout(
             }
         }
     };
-    let _ = stdin_thread.join();
 
     // A grandchild holding a pipe open outlives the helper; bound the drain by
     // the same budget instead of waiting on its EOF forever.
@@ -560,6 +561,26 @@ mod tests {
         with_path_prepended(dir.path(), || {
             run_helper_with_timeout("test", "get", b"ghcr.io", Duration::from_secs(5))
                 .expect("128 KiB of stderr must not block the helper");
+        });
+    }
+
+    /// A grandchild that keeps stdin open without reading must not hold up a helper that already answered.
+    #[test]
+    #[cfg(unix)]
+    fn run_helper_returns_when_a_grandchild_holds_stdin() {
+        let _g = PATH_LOCK.lock().unwrap();
+        let (dir, _bin) = make_mock_helper(
+            "sleep 3 <&0 >/dev/null 2>&1 &\n\
+             echo '{\"Username\":\"u\",\"Secret\":\"p\"}'",
+        );
+        // Past any pipe buffer, so the stdin writer blocks until the grandchild exits.
+        let payload = vec![b'x'; 1024 * 1024];
+        with_path_prepended(dir.path(), || {
+            let start = std::time::Instant::now();
+            run_helper_with_timeout("test", "get", &payload, Duration::from_secs(10))
+                .expect("helper answered");
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(2), "waited on the stdin writer ({:?})", elapsed);
         });
     }
 
