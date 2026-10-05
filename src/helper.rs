@@ -1,12 +1,12 @@
 use super::{CredentialRetrievalError, DockerCredential, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 30-second budget for any single helper subprocess.
 ///
@@ -16,6 +16,9 @@ pub const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 64 KiB cap on helper stdout.
 const HELPER_OUTPUT_CAP: usize = 64 * 1024;
+
+/// How often the wait loop polls the helper for exit.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Sentinel string the docker credential helper protocol emits on stdout when
 /// no matching credential exists. Spec quirk: the message appears regardless
@@ -48,7 +51,7 @@ struct StoreRequest<'a> {
 /// Behavior:
 /// - Resolves the helper path via `resolve_helper_path` (PATH lookup + safety guard).
 /// - Caps stdout at 64 KiB; oversized stdout returns `OutputTooLarge`.
-/// - Enforces the [`HELPER_TIMEOUT`] subprocess budget; overrun returns `Timeout`.
+/// - Enforces the [`HELPER_TIMEOUT`] subprocess budget; overrun kills the helper and returns `Timeout`.
 /// - Sentinel string `"credentials not found in native keychain"` on stdout
 ///   maps to `NotFound` regardless of exit code.
 /// - Non-zero exit without the sentinel returns `HelperFailure { stdout, stderr }`.
@@ -63,7 +66,7 @@ pub fn run_helper(helper: &str, action: &str, stdin_bytes: &[u8]) -> Result<Vec<
 /// test of the timeout path has to wait out — a helper that hangs is observed
 /// identically at 30 s and at 200 ms, so a fixed constant made every such test,
 /// this crate's own included, cost half a minute of real time to say something
-/// about a `recv_timeout` argument.
+/// about a deadline argument.
 pub fn run_helper_with_timeout(
     helper: &str,
     action: &str,
@@ -94,56 +97,52 @@ pub fn run_helper_with_timeout(
         drop(child_stdin);
     });
 
-    let mut child_stdout = child
+    let child_stdout = child
         .stdout
         .take()
         .ok_or(CredentialRetrievalError::HelperCommunicationError)?;
-    let mut child_stderr = child
+    let child_stderr = child
         .stderr
         .take()
         .ok_or(CredentialRetrievalError::HelperCommunicationError)?;
+    // Both pipes drain concurrently: reading one to EOF before the other lets a
+    // helper block on the full second pipe and never exit (ocx-sh/ocx#586).
+    let stdout_rx = drain_capped(child_stdout);
+    let stderr_rx = drain_capped(child_stderr);
 
-    let (tx, rx) = mpsc::channel();
-    let join_handle = thread::spawn(move || {
-        let mut stdout_buf = Vec::with_capacity(HELPER_OUTPUT_CAP.min(8 * 1024));
-        let mut reader = BufReader::new(&mut child_stdout);
-        // Read at most cap + 1 to detect oversize on the next byte.
-        let mut limited = (&mut reader).take((HELPER_OUTPUT_CAP as u64) + 1);
-        let read_result = limited.read_to_end(&mut stdout_buf);
-
-        let mut stderr_buf = Vec::new();
-        let _ = child_stderr.read_to_end(&mut stderr_buf);
-
-        let status_result = child.wait();
-        let _ = tx.send((read_result, stdout_buf, stderr_buf, status_result));
-    });
-
-    let outcome = rx.recv_timeout(timeout);
-    // Drain the stdin writer either way (if we time out the child gets killed,
-    // which forces stdin write to fail and the thread to exit).
-    if outcome.is_err() {
-        // Best-effort: kill the child via a separate spawn so we don't block.
-        // We can't access `child` from here (moved into the join thread); rely
-        // on platform's process supervision — when the thread joins on
-        // `child.wait()` it will keep the child alive until budget is up,
-        // but the parent ocx will exit too. The Timeout variant is the
-        // user-visible contract; under acceptance tests the runner enforces
-        // a wall-clock timeout that kicks in after the 30s budget.
-        let _ = stdin_thread.join();
-        // Drop the join handle without awaiting — let the thread exit when the
-        // child eventually completes; the parent returning Timeout is what
-        // matters to the caller.
-        drop(join_handle);
-        return Err(CredentialRetrievalError::Timeout {
-            seconds: timeout.as_secs(),
-        });
-    }
-    let (read_result, stdout_buf, stderr_buf, status_result) =
-        outcome.map_err(|_| CredentialRetrievalError::HelperCommunicationError)?;
+    let deadline = Instant::now() + timeout;
+    let timed_out = || CredentialRetrievalError::Timeout {
+        seconds: timeout.as_secs(),
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(WAIT_POLL_INTERVAL),
+            outcome => {
+                // ponytail: kills the direct child only; kill the process group if helpers leak grandchildren.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match outcome {
+                    Ok(_) => timed_out(),
+                    Err(_) => CredentialRetrievalError::HelperCommunicationError,
+                });
+            }
+        }
+    };
     let _ = stdin_thread.join();
-    let _ = join_handle.join();
 
-    read_result.map_err(|_| CredentialRetrievalError::HelperCommunicationError)?;
+    // A grandchild holding a pipe open outlives the helper; bound the drain by
+    // the same budget instead of waiting on its EOF forever.
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let stdout_buf = stdout_rx
+        .recv_timeout(remaining())
+        .map_err(|_| timed_out())?
+        .map_err(|_| CredentialRetrievalError::HelperCommunicationError)?;
+    // stderr only feeds the `HelperFailure` diagnostic; a read error there loses text, not the result.
+    let stderr_buf = stderr_rx
+        .recv_timeout(remaining())
+        .map_err(|_| timed_out())?
+        .unwrap_or_default();
 
     if stdout_buf.len() > HELPER_OUTPUT_CAP {
         return Err(CredentialRetrievalError::OutputTooLarge {
@@ -158,7 +157,6 @@ pub fn run_helper_with_timeout(
         return Err(CredentialRetrievalError::NotFound);
     }
 
-    let status = status_result.map_err(|_| CredentialRetrievalError::HelperCommunicationError)?;
     if !status.success() {
         return Err(CredentialRetrievalError::HelperFailure {
             helper: format!("docker-credential-{helper}"),
@@ -168,6 +166,24 @@ pub fn run_helper_with_timeout(
     }
 
     Ok(stdout_buf)
+}
+
+/// Read `pipe` to EOF on its own thread, keeping at most `HELPER_OUTPUT_CAP + 1`
+/// bytes (one past the cap marks oversize) and discarding the rest, so the
+/// helper never blocks on a full pipe.
+fn drain_capped(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = (&mut pipe)
+            .take(HELPER_OUTPUT_CAP as u64 + 1)
+            .read_to_end(&mut buf)
+            .and_then(|_| io::copy(&mut pipe, &mut io::sink()))
+            .map(|_| buf);
+        // The receiver is gone only after a timeout already returned.
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 fn response_from_helper(address: &str, helper: &str, timeout: Duration) -> Result<HelperResponse> {
@@ -501,7 +517,7 @@ mod tests {
     /// The budget fires, and it fires at the value it was handed.
     ///
     /// Driven through `run_helper_with_timeout` at 200 ms: the code path is
-    /// `rx.recv_timeout(timeout)`, which cannot tell one `Duration` from
+    /// a deadline check, which cannot tell one `Duration` from
     /// another, so a short budget observes exactly what a long one would. The
     /// helper still sleeps far past it, which is what makes the pass mean the
     /// timeout fired rather than the child exiting on its own.
@@ -530,6 +546,49 @@ mod tests {
                 elapsed,
             );
         });
+    }
+
+    /// A helper that fills its stderr pipe before closing stdout must not deadlock.
+    #[test]
+    #[cfg(unix)]
+    fn run_helper_drains_large_stderr() {
+        let _g = PATH_LOCK.lock().unwrap();
+        let (dir, _bin) = make_mock_helper(
+            "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'e' >&2\n\
+             echo '{\"Username\":\"u\",\"Secret\":\"p\"}'",
+        );
+        with_path_prepended(dir.path(), || {
+            run_helper_with_timeout("test", "get", b"ghcr.io", Duration::from_secs(5))
+                .expect("128 KiB of stderr must not block the helper");
+        });
+    }
+
+    /// A helper that overruns its budget is killed, not left running.
+    #[test]
+    #[cfg(unix)]
+    fn run_helper_timeout_kills_child() {
+        let _g = PATH_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let pid_file = dir.path().join("pid");
+        let bin = dir.path().join("docker-credential-test");
+        fs::write(&bin, format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid_file.display()))
+            .expect("write helper");
+        let mut perms = fs::metadata(&bin).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).expect("chmod");
+
+        with_path_prepended(dir.path(), || {
+            let err = run_helper_with_timeout("test", "get", b"ghcr.io", Duration::from_millis(500))
+                .expect_err("must time out");
+            assert!(matches!(err, CredentialRetrievalError::Timeout { .. }), "got: {:?}", err);
+        });
+        let pid = fs::read_to_string(&pid_file).expect("helper wrote its pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(!alive, "timed-out helper {} is still running", pid.trim());
     }
 
     #[test]
