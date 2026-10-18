@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,17 @@ struct StoreRequest<'a> {
     username: &'a str,
     #[serde(rename = "Secret")]
     secret: &'a str,
+}
+
+static HELPER_ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Add `vars` to the environment of every helper this process spawns.
+///
+/// Process-global and set-once: the first call wins and later calls are
+/// ignored, so the embedding process declares it at startup, before any lookup.
+/// Applies to every action (`get`, `store`, `erase`, `list`).
+pub fn set_helper_env(vars: Vec<(String, String)>) {
+    let _ = HELPER_ENV.set(vars);
 }
 
 /// Spawn `docker-credential-{helper} {action}`, pipe `stdin`, return stdout bytes.
@@ -78,6 +89,7 @@ pub fn run_helper_with_timeout(
 
     let mut child = Command::new(&path)
         .arg(action)
+        .envs(HELPER_ENV.get().into_iter().flatten().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -432,6 +444,18 @@ mod tests {
             let s = String::from_utf8(out).expect("utf8");
             assert!(s.contains("\"Username\":\"u\""), "stdout was: {s}");
             assert!(s.contains("\"Secret\":\"p\""), "stdout was: {s}");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_helper_env_reaches_the_helper() {
+        let _g = PATH_LOCK.lock().unwrap();
+        let (dir, _bin) = make_mock_helper(r#"echo "$DOCKER_CREDENTIAL_TEST_MARKER""#);
+        set_helper_env(vec![("DOCKER_CREDENTIAL_TEST_MARKER".into(), "reentry".into())]);
+        with_path_prepended(dir.path(), || {
+            let out = run_helper("test", "get", b"ghcr.io").expect("run_helper get");
+            assert_eq!(String::from_utf8(out).expect("utf8").trim(), "reentry");
         });
     }
 
