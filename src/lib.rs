@@ -7,10 +7,11 @@ use base64::engine::general_purpose;
 use base64::Engine;
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str;
 
 type Result<T> = std::result::Result<T, CredentialRetrievalError>;
@@ -118,10 +119,29 @@ pub enum DockerCredential {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    let home_config = || env::var_os("HOME").map(|home| Path::new(&home).join(".docker"));
-    env::var_os("DOCKER_CONFIG")
+    config_dir_from(|name| env::var_os(name), cfg!(windows))
+}
+
+/// The Docker config directory for an environment `var` lookup on a host that is or is not `windows`.
+///
+/// `DOCKER_CONFIG`, else `.docker` under the home: `USERPROFILE` on Windows, `HOME` elsewhere.
+pub fn config_dir_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
+    non_empty_var(&var, "DOCKER_CONFIG")
         .map(PathBuf::from)
-        .or_else(home_config)
+        .or_else(|| home_dir_from(&var, windows).map(|home| home.join(".docker")))
+}
+
+/// The home directory docker and podman resolve: `USERPROFILE` on Windows, `HOME` elsewhere.
+///
+/// Windows never reads `HOME`: cmd.exe and PowerShell leave it unset, and a Git Bash or MSYS one
+/// names a different directory than the one `docker login` and `std::env::home_dir` write under.
+fn home_dir_from(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
+    non_empty_var(var, if windows { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+/// An empty value reads as unset: joining `.docker` onto it would name a path relative to the working directory.
+fn non_empty_var(var: impl Fn(&str) -> Option<OsString>, name: &str) -> Option<OsString> {
+    var(name).filter(|value| !value.is_empty())
 }
 
 fn decode_auth(encoded_auth: &str) -> Result<DockerCredential> {
@@ -239,8 +259,7 @@ pub fn get_podman_credential(server: &str) -> Result<DockerCredential> {
                 .ok_or(CredentialRetrievalError::ConfigNotFound)?
                 .join("containers/auth.json")
         } else {
-            env::var_os("HOME")
-                .map(PathBuf::from)
+            home_dir_from(|name| env::var_os(name), cfg!(windows))
                 .ok_or(CredentialRetrievalError::ConfigNotFound)?
                 .join(".config/containers/auth.json")
         };
@@ -263,12 +282,77 @@ pub fn get_podman_credential(server: &str) -> Result<DockerCredential> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::Path;
 
     // NOTE: tests use `matches!` instead of `assert_eq!` because the new
     // `CredentialRetrievalError::InvalidJson(serde_json::Error)` variant blocks
     // a `#[derive(PartialEq)]` on `CredentialRetrievalError` (serde_json::Error
     // has no PartialEq impl). Behavior + intent identical to the original
     // upstream tests.
+
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: HashMap<String, OsString> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), OsString::from(value)))
+            .collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    #[test]
+    fn config_dir_on_windows_follows_userprofile_when_home_is_unset() {
+        let var = lookup(&[("USERPROFILE", r"C:\Users\someone")]);
+        assert_eq!(
+            config_dir_from(var, true),
+            Some(Path::new(r"C:\Users\someone").join(".docker"))
+        );
+    }
+
+    #[test]
+    fn config_dir_on_windows_ignores_home_when_both_are_set() {
+        let var = lookup(&[
+            ("HOME", r"C:\msys\home"),
+            ("USERPROFILE", r"C:\Users\someone"),
+        ]);
+        assert_eq!(
+            config_dir_from(var, true),
+            Some(Path::new(r"C:\Users\someone").join(".docker"))
+        );
+    }
+
+    #[test]
+    fn config_dir_elsewhere_follows_home_and_ignores_userprofile() {
+        let var = lookup(&[("HOME", "/home/someone"), ("USERPROFILE", "/elsewhere")]);
+        assert_eq!(
+            config_dir_from(var, false),
+            Some(Path::new("/home/someone").join(".docker"))
+        );
+        assert_eq!(
+            config_dir_from(lookup(&[("USERPROFILE", "/elsewhere")]), false),
+            None
+        );
+    }
+
+    #[test]
+    fn config_dir_prefers_docker_config_on_every_host() {
+        let var = lookup(&[
+            ("DOCKER_CONFIG", "/custom"),
+            ("HOME", "/home/someone"),
+            ("USERPROFILE", "/elsewhere"),
+        ]);
+        assert_eq!(config_dir_from(&var, true), Some(PathBuf::from("/custom")));
+        assert_eq!(config_dir_from(&var, false), Some(PathBuf::from("/custom")));
+    }
+
+    #[test]
+    fn an_empty_variable_counts_as_unset() {
+        let var = lookup(&[("DOCKER_CONFIG", ""), ("USERPROFILE", r"C:\Users\someone")]);
+        assert_eq!(
+            config_dir_from(var, true),
+            Some(Path::new(r"C:\Users\someone").join(".docker"))
+        );
+        assert_eq!(config_dir_from(lookup(&[("USERPROFILE", "")]), true), None);
+        assert_eq!(config_dir_from(lookup(&[("HOME", "")]), false), None);
+    }
 
     #[test]
     fn errors_when_no_relevant_config() {
